@@ -246,6 +246,11 @@ To generate benign multicast noise:
 python traffic_gen.py
 ```
 
+To run normally:
+```
+python main_async.py
+```
+
 Useful for testing:
 
 * packet perception
