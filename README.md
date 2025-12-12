@@ -1,5 +1,3 @@
-Agentic Cybersecurity SOC System**
-
 ## 🔒 **Overview**
 
 This project implements a fully autonomous **Agentic AI–based Security Operations Center (SOC)** built **without using any pre-existing agentic AI frameworks or toolkits**.
