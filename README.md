@@ -1,15 +1,4 @@
-Understood.
-Here is a **fully merged, polished, final README.md** including:
-
-* Full **agentic AI explanation**
-* Complete **requirements**
-* Full **installation steps**
-* Detailed **system architecture**
-* Clean, professional format suitable for **GitHub**, **academic submission**, or **industry documentation**
-
----
-
-# **README.md — Agentic Cybersecurity SOC System**
+Agentic Cybersecurity SOC System**
 
 ## 🔒 **Overview**
 
