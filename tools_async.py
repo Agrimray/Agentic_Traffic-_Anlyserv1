@@ -22,7 +22,7 @@ class MCPTool:
 # -----------------------------
 # Packet capture tool (robust)
 # -----------------------------
-class PacketCaptureTool(MCPTool):
+'''class PacketCaptureTool(MCPTool):
     def __init__(self, default_iface=None):
         self.interface = default_iface
 
@@ -144,9 +144,233 @@ class PacketCaptureTool(MCPTool):
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, self._capture_once)
-        return result
+        return result'''
+
+import subprocess
+import asyncio
+import time
+class PacketCaptureTool(MCPTool):
+    def __init__(self, default_iface=None):
+        self.interface = default_iface
+        self.proc = None
+
+    # --------------------------------------------------
+    # LIST INTERFACES
+    # --------------------------------------------------
+    def _list_tshark_interfaces(self):
+        raw = subprocess.check_output(["tshark", "-D"], text=True)
+        interfaces = []
+        for line in raw.splitlines():
+            if ". " not in line:
+                continue
+            idx, rest = line.split(". ", 1)
+            try:
+                interfaces.append((int(idx), rest.split()[0], rest))
+            except:
+                pass
+        return interfaces
+
+    # --------------------------------------------------
+    # USER SELECT
+    # --------------------------------------------------
+    async def select_interface(self):
+        interfaces = self._list_tshark_interfaces()
+        print("Available network interfaces:")
+        for i, _, full in interfaces:
+            print(f"{i}: {full}")
+
+        while True:
+            try:
+                c = int(input("Select interface number: "))
+                self.interface = [x[1] for x in interfaces if x[0] == c][0]
+                print("Selected interface:", self.interface)
+                return
+            except:
+                print("Invalid choice")
+
+    # --------------------------------------------------
+    # START STREAMING TSHARK (ONCE)
+    # --------------------------------------------------
+    def _start_tshark(self):
+        if self.proc:
+            return
+
+        cmd = [
+            "tshark",
+            "-l",
+            "-B", "10",
+            "-i", self.interface,
+            "-T", "fields",
+            "-e", "ip.src",
+            "-e", "ip.dst",
+            "-e", "_ws.col.Protocol",
+            "-e", "tcp.flags",
+            "-e", "tcp.srcport",
+            "-e", "tcp.dstport",
+            "-e", "frame.len"
+        ]
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1
+        )
+
+    # --------------------------------------------------
+    # READ ONE PACKET FROM STREAM
+    # --------------------------------------------------
+    def _read_packet(self):
+        line = self.proc.stdout.readline()
+        if not line:
+            return None
+
+        parts = line.strip().split("\t")
+        while len(parts) < 7:
+            parts.append("")
+
+        return {
+            "packet_summary": {
+                "src_ip": parts[0],
+                "dst_ip": parts[1],
+                "protocol": parts[2],
+                "flags": parts[3],
+                "sport": parts[4],
+                "dport": parts[5],
+                "length": parts[6],
+                "ts": time.time()
+            }
+        }
+
+    # --------------------------------------------------
+    # ASYNC ENTRY POINT
+    # --------------------------------------------------
+    async def call(self, inputs=None):
+        if not self.interface:
+            await self.select_interface()
+
+        if not self.proc:
+            self._start_tshark()
+
+        loop = asyncio.get_event_loop()
+        pkt = await loop.run_in_executor(None, self._read_packet)
+
+        return pkt if pkt else {"packet_summary": {"error": "no_data", "ts": time.time()}}
+
+'''class PacketCaptureTool(MCPTool):
+    def __init__(self, default_iface=None):
+        self.interface = default_iface
+
+    # --------------------------------------------------
+    # LIST AVAILABLE INTERFACES
+    # --------------------------------------------------
+    def _list_tshark_interfaces(self):
+        try:
+            raw = subprocess.check_output(["tshark", "-D"], stderr=subprocess.STDOUT, text=True)
+        except Exception:
+            raise RuntimeError("TShark not installed or not found in PATH")
+
+        interfaces = []
+        for line in raw.splitlines():
+            if ". " not in line:
+                continue
+            idx_str, rest = line.split(". ", 1)
+            try:
+                idx = int(idx_str)
+            except:
+                continue
+
+            device = rest.split(" ")[0].strip()
+            interfaces.append((idx, device, rest))
+
+        return interfaces
+
+    # --------------------------------------------------
+    # USER SELECTS INTERFACE
+    # --------------------------------------------------
+    async def select_interface(self):
+        interfaces = self._list_tshark_interfaces()
+        print("Available network interfaces:")
+        for idx, token, full in interfaces:
+            print(f"{idx}: {full}")
+
+        while True:
+            try:
+                choice = int(input("Select interface number to capture packets from: "))
+                iface = [x for x in interfaces if x[0] == choice][0]
+                self.interface = iface[1]
+                print(f"Selected interface: {self.interface}")
+                break
+            except:
+                print("Invalid choice. Try again.")
+
+    # --------------------------------------------------
+    # INTERNAL SINGLE PACKET CAPTURE
+    # --------------------------------------------------
+    def _capture_once(self):
+        if not self.interface:
+            return {"packet_summary": {"error": "no_interface_selected", "ts": time.time()}}
+
+        # Correct tshark fields for SYN detection
+        cmd = [
+    "tshark",
+    "-l",
+    "-i", self.interface,
+    "-c", "50",
+    "-T", "fields",
+    "-e", "ip.src",
+    "-e", "ip.dst",
+    "-e", "_ws.col.Protocol",
+    "-e", "tcp.flags",
+    "-e", "tcp.srcport",
+    "-e", "tcp.dstport",
+    "-e", "frame.len"
+]
 
 
+        try:
+            raw = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        except Exception as e:
+            return {"packet_summary": {"error": str(e), "ts": time.time()}}
+
+        # Clean lines
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        cleaned = [ln for ln in lines if not ln.startswith("Capturing on") and "packet captured" not in ln]
+
+        if not cleaned:
+            return {"packet_summary": {"error": "no_packet_data", "ts": time.time()}}
+
+        parts = cleaned[0].split("\t")
+        while len(parts) < 7:
+            parts.append("")
+
+        return {
+            "packet_summary": {
+                "src_ip": parts[0],
+                "dst_ip": parts[1],
+                "protocol": parts[2],
+                "flags": parts[3],
+                "sport": parts[4],
+                "dport": parts[5],
+                "length": parts[6],
+                "ts": time.time()
+            }
+        }
+
+    # --------------------------------------------------
+    # ASYNC WRAPPER
+    # --------------------------------------------------
+    async def call(self, inputs):
+        if isinstance(inputs, dict) and inputs.get("iface"):
+            self.interface = str(inputs["iface"]).split()[0]
+
+        if not self.interface:
+            await self.select_interface()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._capture_once)
+'''
 
 
 # -----------------------------

@@ -61,7 +61,7 @@ class AgentIP:
 # -----------------------------
 # ThreatIdentifierAgent (ML hybrid)
 # -----------------------------
-class ThreatIdentifierAgent:
+'''class ThreatIdentifierAgent:
     """
     Hybrid ML-based agent:
       - extracts numeric features from packet + recent context (no hard rules)
@@ -287,6 +287,481 @@ class ThreatIdentifierAgent:
             pass
 
         return result
+'''
+# -----------------------------
+# ThreatIdentifierAgent (Signature + ML Hybrid)
+# -----------------------------
+'''class ThreatIdentifierAgent:
+    """
+    BEST VERSION — stateless packet source, sliding local window, signature + ML hybrid.
+    """
+
+    def __init__(self, memory, llm_tool=None, supervised_model=None, window_seconds=5):
+        self.memory = memory
+        self.llm_tool = llm_tool
+        self.supervised = supervised_model
+        self.window = window_seconds
+
+        # local window of packets
+        self.recent_packets = []   # each entry = dict of packet fields
+        self.max_buffer = 800
+
+        # ML fallback
+        self._ml_buffer = []
+        if SKLEARN:
+            try:
+                self.iforest = IsolationForest(
+                    n_estimators=100,
+                    contamination="auto",
+                    random_state=42
+                )
+                self.scaler = StandardScaler()
+            except:
+                self.iforest = None
+                self.scaler = None
+        else:
+            self.iforest = None
+            self.scaler = None
+
+    # ---------------------------------------------------------
+    # Add packet to sliding window (5 sec default)
+    # ---------------------------------------------------------
+    def _update_window(self, packet):
+        now = packet.get("ts", time.time())
+
+        # Convert safely
+        try:
+            plen = float(packet.get("length") or 0)
+        except:
+            plen = 0
+
+        entry = {
+            "ts": now,
+            "src": packet.get("src_ip"),
+            "dst": packet.get("dst_ip"),
+            "len": plen,
+            "proto": (packet.get("protocol") or "").upper(),
+            "flags": (packet.get("flags") or "").lower(),
+            "sport": packet.get("sport"),
+            "dport": packet.get("dport")
+        }
+
+        self.recent_packets.append(entry)
+
+        # keep only recent window
+        cutoff = now - self.window
+        self.recent_packets = [p for p in self.recent_packets if p["ts"] >= cutoff]
+
+        # cap buffer
+        if len(self.recent_packets) > self.max_buffer:
+            self.recent_packets = self.recent_packets[-self.max_buffer:]
+
+    # ---------------------------------------------------------
+    # Signature detection for attacks
+    # ---------------------------------------------------------
+    def _detect_signatures(self, packet):
+        src = packet.get("src_ip")
+        dst = packet.get("dst_ip")
+        proto = (packet.get("protocol") or "").upper()
+        flags = (packet.get("flags") or "").lower()
+        length = float(packet.get("length") or 0)
+
+        # NOTE: Correct SYN flag detection on Windows tshark
+        IS_SYN = flags in ("0x2", "0x0002")
+
+        # -----------------------------
+        # SYN FLOOD DETECTION
+        # -----------------------------
+        syn_packets = [
+            p for p in self.recent_packets
+            if p["proto"] == "TCP" and p["flags"] in ("0x2", "0x0002")
+        ]
+
+        syn_to_same_target = [p for p in syn_packets if p["dst"] == dst]
+        unique_sources = len({p["src"] for p in syn_to_same_target})
+        syn_rate = len(syn_to_same_target)
+
+        # Medium sensitivity threshold
+        if syn_rate >= 3 and unique_sources >= 2:
+            return ("syn_flood", 0.99)
+
+        # -----------------------------
+        # UDP FLOOD
+        # -----------------------------
+        udp_packets = [p for p in self.recent_packets if p["proto"] == "UDP"]
+
+        if len(udp_packets) > 20 and sum(p["len"] for p in udp_packets) > 8000:
+            return ("udp_flood", 0.95)
+
+        # -----------------------------
+        # ICMP FLOOD
+        # -----------------------------
+        icmp_packets = [p for p in self.recent_packets if p["proto"] == "ICMP"]
+
+        if len(icmp_packets) > 15:
+            return ("icmp_flood", 0.90)
+
+        # -----------------------------
+        # DNS Amplification
+        # -----------------------------
+        if proto == "UDP" and packet.get("dport") == "53" and length > 600:
+            return ("dns_amplification", 0.92)
+
+        # -----------------------------
+        # PORT SCAN (vertical)
+        # -----------------------------
+        dst_ports = {}
+        for p in self.recent_packets:
+            if p["src"] == src and p["dport"]:
+                dst_ports[p["dport"]] = dst_ports.get(p["dport"], 0) + 1
+
+        if len(dst_ports.keys()) >= 8:
+            return ("port_scan_vertical", 0.88)
+
+        # -----------------------------
+        # PORT SCAN (horizontal)
+        # -----------------------------
+        src_ips = {}
+        for p in self.recent_packets:
+            if p["dst"] == dst and p["src"]:
+                src_ips[p["src"]] = src_ips.get(p["src"], 0) + 1
+
+        if len(src_ips.keys()) >= 10:
+            return ("port_scan_horizontal", 0.86)
+
+        # -----------------------------
+        # ARP Spoof
+        # -----------------------------
+        if proto == "ARP":
+            ip_counter = {}
+            for p in self.recent_packets:
+                if p["proto"] == "ARP" and p["src"]:
+                    ip_counter[p["src"]] = ip_counter.get(p["src"], 0) + 1
+
+            if any(v >= 4 for v in ip_counter.values()):
+                return ("arp_spoof", 0.91)
+
+        # -----------------------------
+        # Generic DoS
+        # -----------------------------
+        if len(self.recent_packets) >= 120:
+            return ("dos_burst", 0.85)
+
+        return None, None
+
+    # ---------------------------------------------------------
+    # Feature extraction for ML fallback
+    # ---------------------------------------------------------
+    async def _extract_features(self, packet):
+
+        ps = packet or {}
+
+        src = ps.get("src_ip")
+        proto = (ps.get("protocol") or "").upper()
+
+        try:
+            length = float(ps.get("length") or 0)
+        except:
+            length = 0
+
+        same_src = [p for p in self.recent_packets if p["src"] == src]
+        recent_count = len(same_src)
+
+        avg_len = (sum(p["len"] for p in same_src) / len(same_src)) if same_src else 0
+
+        distinct_dsts = len({p["dst"] for p in same_src if p["dst"]})
+
+        # inter-arrival times
+        times = sorted([p["ts"] for p in same_src])
+        intervals = [times[i] - times[i - 1] for i in range(1, len(times))]
+        mean_ia = (sum(intervals) / len(intervals)) if intervals else 0
+
+        features = [
+            length,
+            recent_count,
+            avg_len,
+            float(distinct_dsts),
+            mean_ia,
+            1.0 if proto == "TCP" else 0.0,
+            1.0 if proto == "UDP" else 0.0,
+            1.0 if ("TLS" in proto or "SSL" in proto) else 0.0,
+        ]
+
+        return features, {
+            "length": length,
+            "recent_count": recent_count,
+            "avg_len": avg_len,
+            "distinct_dsts": distinct_dsts,
+            "mean_ia": mean_ia
+        }
+
+    # ---------------------------------------------------------
+    # MAIN IDENTIFICATION PIPELINE
+    # ---------------------------------------------------------
+    async def identify(self, packet, ip_info=None):
+
+        # Update sliding window
+        self._update_window(packet)
+
+        # 1️⃣ Signature-based detection FIRST
+        sig, conf = self._detect_signatures(packet)
+        if sig:
+            return {
+                "threat_type": sig,
+                "confidence": conf,
+                "details": {"signature_match": True}
+            }
+
+        # 2️⃣ ML Fallback
+        fv, fdict = await self._extract_features(packet)
+
+        try:
+            anomaly = min(1.0, fv[0] / (fv[2] * 2 + 1))
+        except:
+            anomaly = 0
+
+        rep = 0.0
+        if isinstance(ip_info, dict):
+            if ip_info.get("org"): rep += 0.2
+            if ip_info.get("country"): rep += 0.1
+            if ip_info.get("note") == "private_ip": rep -= 0.4
+
+        rep = max(0, min(1, rep))
+
+        score = (0.65 * anomaly) + (0.05 * rep)
+        score = max(0, min(1, score))
+
+        threat = "anomaly" if score >= 0.5 else "benign"
+
+        return {
+            "threat_type": threat,
+            "confidence": score,
+            "details": fdict
+        }'''
+# -------------------------------------------------------------
+# ThreatIdentifierAgent (Signature + ML Hybrid)  — FIXED VERSION
+# -------------------------------------------------------------
+class ThreatIdentifierAgent:
+    """
+    Stable hybrid threat detector for Windows/tshark.
+    """
+
+    def __init__(self, memory, llm_tool=None, supervised_model=None, window_seconds=40):
+        self.memory = memory
+        self.llm_tool = llm_tool
+        self.supervised = supervised_model
+
+        self.window = window_seconds
+        self.recent_packets = []
+        self.max_buffer = 800
+
+        if SKLEARN:
+            try:
+                self.iforest = IsolationForest(
+                    n_estimators=100,
+                    contamination="auto",
+                    random_state=42
+                )
+                self.scaler = StandardScaler()
+            except:
+                self.iforest = None
+                self.scaler = None
+        else:
+            self.iforest = None
+            self.scaler = None
+
+    # ---------------------------------------------------
+    # Normalize tcp.flags from tshark
+    # ---------------------------------------------------
+    def _normalize_flags(self, raw):
+        if not raw:
+            return ""
+
+        f = str(raw).lower().strip()
+        if f.startswith("0x"):
+            f = f[2:]
+        if len(f) > 2:
+            f = f[-2:]
+
+        mapping = {
+            "02": "SYN",
+            "12": "SYN-ACK",
+            "10": "ACK",
+            "04": "RST",
+        }
+        return mapping.get(f, f.upper())
+
+    # ---------------------------------------------------
+    # Track sliding window packets
+    # ---------------------------------------------------
+    def _update_window(self, pkt):
+        now = pkt.get("ts", time.time())
+
+        try:
+            plen = float(pkt.get("length") or 0)
+        except:
+            plen = 0.0
+
+        entry = {
+            "ts": now,
+            "src": pkt.get("src_ip"),
+            "dst": pkt.get("dst_ip"),
+            "len": plen,
+            "proto": (pkt.get("protocol") or "").upper(),
+            "flags": self._normalize_flags(pkt.get("flags")),
+            "sport": int(pkt.get("sport")) if pkt.get("sport") else None,
+            "dport": int(pkt.get("dport")) if pkt.get("dport") else None
+        }
+
+        self.recent_packets.append(entry)
+
+        cutoff = now - self.window
+        self.recent_packets = [p for p in self.recent_packets if p["ts"] >= cutoff]
+
+        if len(self.recent_packets) > self.max_buffer:
+            self.recent_packets = self.recent_packets[-self.max_buffer:]
+
+    # ---------------------------------------------------
+    # Signature-based IDS
+    # ---------------------------------------------------
+    def _detect_signatures(self, pkt):
+
+        src = pkt.get("src_ip")
+        dst = pkt.get("dst_ip")
+        proto = (pkt.get("protocol") or "").upper()
+        flags = self._normalize_flags(pkt.get("flags"))
+        
+
+        # --------------------- SYN FLOOD ---------------------
+        syn_pkts = [p for p in self.recent_packets if p["proto"] == "TCP" and p["flags"] == "SYN"]
+        target_syn = [p for p in syn_pkts if p["dst"] == dst]
+
+        print(
+    "DEBUG SYN:",
+    "count =", len(target_syn),
+    "unique_src =", len({p["src"] for p in target_syn})
+)
+
+        #if len(target_syn) >= 40 and len({p["src"] for p in target_syn}) >= 15:
+            #return ("syn_flood", 0.99)
+        if len(target_syn) >= 10: #and len({p["src"] for p in target_syn}) >= 3:
+            print("syn flood")
+            return ("syn_flood", 0.99)
+
+
+        # --------------------- UDP Flood ---------------------
+        udp_pkts = [p for p in self.recent_packets if p["proto"] == "UDP"]
+        if len(udp_pkts) > 200:
+            return ("udp_flood", 0.95)
+
+        # --------------------- ICMP Flood --------------------
+        icmp_pkts = [p for p in self.recent_packets if p["proto"] == "ICMP"]
+        if len(icmp_pkts) > 150:
+            return ("icmp_flood", 0.90)
+
+        # --------------------- DNS Amplification ------------
+        try:
+            if proto == "UDP" and int(pkt.get("dport") or 0) == 53 and float(pkt.get("length") or 0) > 600:
+                return ("dns_amplification", 0.92)
+        except:
+            pass
+
+        # --------------------- Port scan vertical -----------
+        ports = {p["dport"] for p in self.recent_packets if p["src"] == src and p["dport"]}
+        if len(ports) >= 15:
+            return ("port_scan_vertical", 0.88)
+
+        # --------------------- Port scan horizontal ---------
+        sources = {p["src"] for p in self.recent_packets if p["dst"] == dst and p["src"]}
+        if len(sources) >= 30:
+            return ("port_scan_horizontal", 0.86)
+
+        # --------------------- DoS burst ---------------------
+        if len(self.recent_packets) >= 400:
+            return ("dos_burst", 0.85)
+
+        return None, None
+
+    # ---------------------------------------------------
+    # ML Fallback Feature Extraction
+    # ---------------------------------------------------
+    async def _extract_features(self, pkt):
+
+        src = pkt.get("src_ip")
+        proto = (pkt.get("protocol") or "").upper()
+
+        try:
+            length = float(pkt.get("length") or 0)
+        except:
+            length = 0.0
+
+        same_src = [p for p in self.recent_packets if p["src"] == src]
+
+        rec = len(same_src)
+        avg_len = sum(p["len"] for p in same_src) / rec if rec else 0
+        uniq_dst = len({p["dst"] for p in same_src if p["dst"]})
+
+        times = sorted([p["ts"] for p in same_src])
+        intervals = [times[i] - times[i-1] for i in range(1, len(times))]
+        mean_ia = sum(intervals) / len(intervals) if intervals else 0
+
+        return [
+            length,
+            rec,
+            avg_len,
+            uniq_dst,
+            mean_ia,
+            1.0 if proto == "TCP" else 0.0,
+            1.0 if proto == "UDP" else 0.0,
+            1.0 if "TLS" in proto else 0.0,
+        ], {
+            "length": length,
+            "recent_count": rec,
+            "avg_len": avg_len,
+            "unique_dsts": uniq_dst,
+            "mean_ia": mean_ia
+        }
+
+    # ---------------------------------------------------
+    # MAIN PIPELINE (THIS WAS MISSING)
+    # ---------------------------------------------------
+    async def identify(self, packet, ip_info=None):
+
+        self._update_window(packet)
+
+        # 1) Signatures
+        sig, conf = self._detect_signatures(packet)
+        if sig:
+            return {
+                "threat_type": sig,
+                "confidence": conf,
+                "details": {"signature_match": True}
+            }
+
+        # 2) ML fallback
+        fv, fdict = await self._extract_features(packet)
+
+        try:
+            anomaly = min(1.0, fv[0] / (fv[2] * 2 + 1))
+        except:
+            anomaly = 0.0
+
+        rep = 0.0
+        if ip_info:
+            if ip_info.get("org"): rep += 0.2
+            if ip_info.get("country"): rep += 0.1
+            if ip_info.get("note") == "private_ip": rep -= 0.4
+
+        rep = max(0, min(rep, 1))
+
+        score = 0.65 * anomaly + 0.05 * rep
+        score = max(0, min(1, score))
+
+        return {
+            "threat_type": "anomaly" if score > 0.5 else "benign",
+            "confidence": score,
+            "details": fdict
+        }
 
 
 # -----------------------------
