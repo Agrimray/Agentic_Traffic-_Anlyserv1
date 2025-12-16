@@ -282,3 +282,9 @@ class CaptureDeepTool(ActionTool):
             return {"ok": True, "file": out}
         except Exception as e:
             return {"error": str(e)}
+
+
+
+
+
+

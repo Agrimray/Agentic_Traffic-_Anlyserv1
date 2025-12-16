@@ -365,7 +365,7 @@ class PolicyAgent:
             human_cut = _np.percentile(vals_sorted, self.human_p*100)
         else:
             # warmup defaults (not rigid rules — only fallback)
-            auto_cut = 0.98
+            auto_cut = 0.9
             human_cut = 0.8
         decision = {"allow_auto": False, "require_human": False, "action_suggestion": None, "explain": ""}
         if risk >= auto_cut:
